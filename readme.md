@@ -30,6 +30,11 @@ How to use
 http://localhost:8000/?stream=<stream_url>
 ```
 
+Options
+- Can use yt-dlp or selenium to get the stream url. Yt-dlp is better because it doesn't require a virtual audio cable.
+- Can choose to save the audio file or stream directly to Whisper.
+
+
 Notes:
 - Only tested locally on Mac M3
 - The virtual audio cable is "BlackHole 2ch"
@@ -37,7 +42,7 @@ Notes:
 
 
 Todo:
-- [ ] Make it so you can convert the stream to text directly instead of saving to a file
+- [x] Make it so you can convert the stream to text directly instead of saving to a file
 - [ ] Explore other models for transcription
 - [ ] Deploy to a cloud service
 - [ ] Perform latency testing
