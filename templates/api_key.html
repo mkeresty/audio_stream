@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your API Key</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; }
+        .api-key { background-color: #f0f0f0; padding: 10px; border-radius: 5px; word-break: break-all; }
+    </style>
+</head>
+<body>
+    <h1>Your API Key</h1>
+    <p>Here's your API key. Please save it securely as it won't be shown again:</p>
+    <div class="api-key">{{ api_key }}</div>
+    <p>You can now use this API key to access the transcription service.</p>
+    <p><a href="/transcribe?api_key={{ api_key }}">Go to Transcription Page</a></p>
+</body>
+</html>

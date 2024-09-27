@@ -1,18 +1,17 @@
 import logging
-from fastapi import FastAPI, WebSocket, Request, Depends, HTTPException, Form
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse
-from fastapi.security import APIKeyHeader
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
 import asyncio
 import whisper
 import numpy as np
 import pyaudio
 import wave
 import threading
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import time
 import warnings
 import yt_dlp
@@ -22,7 +21,6 @@ import os
 import psutil
 from collections import deque
 import datetime
-import secrets
 
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
 
@@ -30,26 +28,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
-# Database setup
-DATABASE_URL = "sqlite:///./test.db"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    email = Column(String, unique=True, index=True)
-    api_key = Column(String, unique=True, index=True)
-
-Base.metadata.create_all(bind=engine)
-
-# Set up Jinja2 templates
-templates = Jinja2Templates(directory="templates")
-
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 model = whisper.load_model("base.en")  # Load the English-only base model
 
@@ -92,24 +70,6 @@ class PerformanceMonitor:
         }
 
 performance_monitor = PerformanceMonitor()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def generate_api_key():
-    return secrets.token_urlsafe(32)
-
-async def get_api_key(api_key: str = Depends(api_key_header), db: Session = Depends(get_db)):
-    if api_key is None:
-        raise HTTPException(status_code=403, detail="Could not validate credentials")
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        raise HTTPException(status_code=403, detail="Could not validate credentials")
-    return api_key
 
 async def get_live_audio_url(youtube_url):
     ydl_opts = {
@@ -173,20 +133,8 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     stream_url = websocket.query_params.get("stream")
-    api_key = websocket.query_params.get("api_key")
-    
     if not stream_url:
         await websocket.close(code=1000, reason="No stream URL provided")
-        return
-    
-    if not api_key:
-        await websocket.close(code=1000, reason="No API key provided")
-        return
-    
-    db = next(get_db())
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        await websocket.close(code=1000, reason="Invalid API key")
         return
 
     if USE_YT_DLP:
@@ -227,42 +175,69 @@ async def websocket_endpoint(websocket: WebSocket):
         ...
 
 @app.get("/")
-async def home(request: Request):
-    return templates.TemplateResponse("register.html", {"request": request})
-
-@app.post("/register")
-async def register_user(request: Request, username: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.username == username).first()
-    if db_user:
-        return templates.TemplateResponse("register.html", {"request": request, "error": "Username already registered"})
-    
-    db_user = db.query(User).filter(User.email == email).first()
-    if db_user:
-        return templates.TemplateResponse("register.html", {"request": request, "error": "Email already registered"})
-    
-    new_user = User(username=username, email=email, api_key=generate_api_key())
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    
-    return templates.TemplateResponse("api_key.html", {"request": request, "api_key": new_user.api_key})
-
-@app.get("/transcribe")
-async def get_transcribe_page(request: Request):
+async def get(request: Request):
     stream_url = request.query_params.get("stream", "")
-    api_key = request.query_params.get("api_key", "")
-    return templates.TemplateResponse("transcribe.html", {"request": request, "stream_url": stream_url, "api_key": api_key})
-
-@app.get("/protected")
-async def protected_route(api_key: str = Depends(get_api_key)):
-    return {"message": "This is a protected route"}
-
-@app.get("/users/me")
-async def read_users_me(api_key: str = Depends(get_api_key), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"username": user.username, "email": user.email}
+    return HTMLResponse(f"""
+        <html>
+            <body>
+                <h1>WebSocket Transcription</h1>
+                <div id="transcription">
+                    <h2>Transcriptions</h2>
+                    <ul id='messages'></ul>
+                </div>
+                <div id='performance'>
+                    <h2>Performance Metrics</h2>
+                    <p>Average Transcription Time: <span id='avg_time'></span> seconds</p>
+                    <p>Average Latency: <span id='avg_latency'></span> seconds</p>
+                    <p>Memory Usage: <span id='memory'></span> MB</p>
+                    <p>CPU Usage: <span id='cpu'></span>%</p>
+                    <p>Uptime: <span id='uptime'></span> seconds</p>
+                    <p>Transcription Count: <span id='count'></span></p>
+                </div>
+                <script>
+                    var ws;
+                    function connect() {{
+                        var stream_url = "{stream_url}";
+                        ws = new WebSocket(`ws://localhost:8000/ws?stream=${{encodeURIComponent(stream_url)}}`);
+                        ws.onmessage = function(event) {{
+                            var data = JSON.parse(event.data);
+                            if (data.type === "transcription") {{
+                                var messages = document.getElementById('messages');
+                                var message = document.createElement('li');
+                                var content = document.createTextNode(data.text);
+                                message.appendChild(content);
+                                messages.appendChild(message);
+                                messages.scrollTop = messages.scrollHeight;
+                            }} else if (data.type === "performance") {{
+                                document.getElementById('avg_time').textContent = data.avg_transcription_time.toFixed(3);
+                                document.getElementById('avg_latency').textContent = data.avg_latency.toFixed(3);
+                                document.getElementById('memory').textContent = data.memory_usage_mb.toFixed(2);
+                                document.getElementById('cpu').textContent = data.cpu_usage_percent.toFixed(2);
+                                document.getElementById('uptime').textContent = data.uptime_seconds.toFixed(0);
+                                document.getElementById('count').textContent = data.transcription_count;
+                            }}
+                        }};
+                        ws.onclose = function(event) {{
+                            console.log("WebSocket closed. Reconnecting...");
+                            setTimeout(connect, 1000);
+                        }};
+                        ws.onerror = function(error) {{
+                            console.error("WebSocket error:", error);
+                        }};
+                    }}
+                    connect();
+                </script>
+                <style>
+                    #messages {{
+                        height: 300px;
+                        overflow-y: auto;
+                        border: 1px solid #ccc;
+                        padding: 10px;
+                    }}
+                </style>
+            </body>
+        </html>
+    """)
 
 if __name__ == "__main__":
     import uvicorn
