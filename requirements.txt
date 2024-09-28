@@ -1,7 +1,10 @@
 fastapi
 uvicorn
-websockets
-openai-whisper
+yt-dlp
 numpy
-pyaudio
-selenium
+websockets
+psutil
+openai-whisper
+torch
+
+#pyaudio is not supported on replit

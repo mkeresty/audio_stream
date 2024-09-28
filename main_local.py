@@ -1,6 +1,6 @@
 import logging
 from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import asyncio
 import whisper
 import numpy as np
@@ -21,6 +21,7 @@ import os
 import psutil
 from collections import deque
 import datetime
+from starlette.websockets import WebSocketState, WebSocketDisconnect
 
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
 
@@ -71,62 +72,102 @@ class PerformanceMonitor:
 
 performance_monitor = PerformanceMonitor()
 
-async def get_live_audio_url(youtube_url):
+class SharedTranscription:
+    def __init__(self, stream_url):
+        self.stream_url = stream_url
+        self.audio_generator = None
+        self.clients = set()
+        self.lock = asyncio.Lock()
+        self.start_time = datetime.datetime.now()
+
+    async def start(self):
+        self.audio_generator = record_audio_yt_dlp(self.stream_url)
+
+    async def stop(self):
+        if self.audio_generator:
+            await self.audio_generator.aclose()
+
+    def get_info(self):
+        return {
+            "stream_url": self.stream_url,
+            "client_count": len(self.clients),
+            "uptime": str(datetime.datetime.now() - self.start_time)
+        }
+
+    async def process_audio(self):
+        while True:
+            try:
+                async for audio_chunk, chunk_timestamp in self.audio_generator:
+                    yield audio_chunk, chunk_timestamp
+            except Exception as e:
+                logger.error(f"Error in process_audio: {str(e)}")
+                await asyncio.sleep(5)  # Wait a bit before restarting
+                self.audio_generator = record_audio_yt_dlp(self.stream_url)
+
+active_transcriptions = {}
+
+async def get_latest_stream_url(youtube_url):
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'no_color': True,
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = await asyncio.to_thread(ydl.extract_info, youtube_url, download=False)
-        return info['url']
+        if info is None:
+            raise Exception("Failed to extract stream info")
+        
+        formats = info.get('formats', [info])
+        audio_format = next((f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none'), None)
+        if audio_format is None:
+            raise Exception("No suitable audio format found")
+        
+        return audio_format['url']
 
 async def record_audio_yt_dlp(youtube_url):
-    audio_url = await get_live_audio_url(youtube_url)
-    ffmpeg_cmd = [
-        'ffmpeg',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-i', audio_url,
-        '-f', 's16le',
-        '-ar', str(RATE),
-        '-ac', str(CHANNELS),
-        '-'
-    ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *ffmpeg_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    
-    buffer = deque(maxlen=BUFFER_SIZE)
-    start_time = time.time()
-    
     while True:
-        audio_chunk = await process.stdout.read(CHUNK * CHANNELS * 2 * RECORD_SECONDS)
-        if not audio_chunk:
-            break
-        
-        current_time = time.time()
-        chunk_age = current_time - start_time
-        buffer.append((audio_chunk, chunk_age, current_time))
-        
-        if len(buffer) == BUFFER_SIZE:
-            oldest_chunk, oldest_age, oldest_timestamp = buffer[0]
-            if oldest_age > BUFFER_SIZE * CHUNK_DURATION:
-                # We've buffered enough old data, start yielding from the most recent
-                for chunk, _, timestamp in reversed(buffer):
-                    yield chunk, timestamp
-                buffer.clear()
-            else:
-                yield oldest_chunk, oldest_timestamp
-                buffer.popleft()
-        
-        start_time = current_time
-    
-    process.terminate()
+        try:
+            audio_url = await get_latest_stream_url(youtube_url)
+            
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
+                '-i', audio_url,
+                '-f', 's16le',
+                '-ar', str(RATE),
+                '-ac', str(CHANNELS),
+                '-'
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+
+            start_time = time.time()
+            while True:
+                audio_chunk = await process.stdout.read(CHUNK * CHANNELS * 2 * RECORD_SECONDS)
+                if not audio_chunk:
+                    break
+                
+                yield audio_chunk, time.time()
+                
+                # Refresh the stream URL every 30 seconds
+                if time.time() - start_time > 30:
+                    break
+
+            process.terminate()
+            await process.wait()
+
+        except Exception as e:
+            logger.error(f"Error in record_audio_yt_dlp: {str(e)}")
+            await asyncio.sleep(5)  # Wait a bit before retrying
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -137,42 +178,61 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1000, reason="No stream URL provided")
         return
 
-    if USE_YT_DLP:
-        audio_generator = record_audio_yt_dlp(stream_url)
+    shared_transcription = None
+    try:
+        async with asyncio.Lock():
+            if stream_url not in active_transcriptions:
+                shared_transcription = SharedTranscription(stream_url)
+                active_transcriptions[stream_url] = shared_transcription
+                await shared_transcription.start()
+            else:
+                shared_transcription = active_transcriptions[stream_url]
+
+        shared_transcription.clients.add(websocket)
+
+        async for audio_chunk, chunk_timestamp in shared_transcription.process_audio():
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                break
+
+            chunk_start_time = time.time()
+            
+            audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            transcription_start = time.time()
+            result = model.transcribe(audio_np, language="en")
+            transcription_time = time.time() - transcription_start
+            
+            latency = time.time() - chunk_start_time
+            performance_monitor.update_metrics(transcription_time, latency)
+            
+            if result["text"]:
+                timestamp = datetime.datetime.fromtimestamp(chunk_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                message = {
+                    "type": "transcription",
+                    "text": f"[{timestamp}] {result['text']}"
+                }
+                await asyncio.gather(*[client.send_json(message) for client in shared_transcription.clients if client.client_state == WebSocketState.CONNECTED])
+                logger.info(f"Transcribed: [{timestamp}] {result['text']}")
+            
+            performance_message = {
+                "type": "performance",
+                **performance_monitor.get_metrics()
+            }
+            await asyncio.gather(*[client.send_json(performance_message) for client in shared_transcription.clients if client.client_state == WebSocketState.CONNECTED])
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"Error in websocket_endpoint: {str(e)}")
+    finally:
+        if shared_transcription:
+            shared_transcription.clients.discard(websocket)
+            if not shared_transcription.clients:
+                await shared_transcription.stop()
+                del active_transcriptions[stream_url]
         
-        try:
-            async for audio_chunk, chunk_timestamp in audio_generator:
-                chunk_start_time = time.time()
-                
-                audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                
-                transcription_start = time.time()
-                result = model.transcribe(audio_np, language="en")
-                transcription_time = time.time() - transcription_start
-                
-                latency = time.time() - chunk_start_time
-                performance_monitor.update_metrics(transcription_time, latency)
-                
-                if result["text"]:
-                    timestamp = datetime.datetime.fromtimestamp(chunk_timestamp).strftime('%Y-%m-%d %H:%M:%S')
-                    await websocket.send_json({
-                        "type": "transcription",
-                        "text": f"[{timestamp}] {result['text']}"
-                    })
-                    logger.info(f"Transcribed: [{timestamp}] {result['text']}")
-                
-                await websocket.send_json({
-                    "type": "performance",
-                    **performance_monitor.get_metrics()
-                })
-                
-        except Exception as e:
-            logger.error(f"Error in websocket_endpoint (yt-dlp): {str(e)}")
-        finally:
+        if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.close()
-    else:
-        # Selenium logic remains unchanged
-        ...
 
 @app.get("/")
 async def get(request: Request):
@@ -239,6 +299,20 @@ async def get(request: Request):
         </html>
     """)
 
+@app.get("/active-streams")
+async def get_active_streams():
+    streams = []
+    for stream_url, transcription in active_transcriptions.items():
+        streams.append(transcription.get_info())
+    return JSONResponse(content={"active_streams": streams})
+
 if __name__ == "__main__":
+    import os
+    import subprocess
+
+    # Run FFmpeg installation script
+    if not os.path.exists(os.path.expanduser('~/.local/bin/ffmpeg')):
+        subprocess.run(['bash', 'install_ffmpeg.sh'], check=True)
+
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)

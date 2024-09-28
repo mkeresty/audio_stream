@@ -1,17 +1,8 @@
 import logging
-from fastapi import FastAPI, WebSocket, Request, Depends, HTTPException, Form
-from fastapi.responses import HTMLResponse
-from fastapi.security import APIKeyHeader
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 import asyncio
-import whisper
 import numpy as np
-import pyaudio
-import wave
 import threading
 import time
 import warnings
@@ -22,7 +13,8 @@ import os
 import psutil
 from collections import deque
 import datetime
-import secrets
+from starlette.websockets import WebSocketState, WebSocketDisconnect
+import whisper
 
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
 
@@ -31,35 +23,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Database setup
-DATABASE_URL = "sqlite:///./test.db"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    email = Column(String, unique=True, index=True)
-    api_key = Column(String, unique=True, index=True)
-
-Base.metadata.create_all(bind=engine)
-
-# Set up Jinja2 templates
-templates = Jinja2Templates(directory="templates")
-
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-model = whisper.load_model("base.en")  # Load the English-only base model
-
 # Audio recording settings
 CHUNK = 1024
-FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
-WAVE_OUTPUT_FILENAME = "output.wav"
 
 # Flags to control behavior
 USE_YT_DLP = True
@@ -67,6 +35,9 @@ SAVE_TO_FILE = False
 
 BUFFER_SIZE = 10  # Number of audio chunks to buffer
 CHUNK_DURATION = RECORD_SECONDS  # Duration of each chunk in seconds
+
+# Load Whisper model
+model = whisper.load_model("tiny")
 
 class PerformanceMonitor:
     def __init__(self):
@@ -93,177 +64,258 @@ class PerformanceMonitor:
 
 performance_monitor = PerformanceMonitor()
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+class SharedTranscription:
+    def __init__(self, stream_url):
+        self.stream_url = stream_url
+        self.audio_generator = None
+        self.clients = set()
+        self.lock = asyncio.Lock()
+        self.start_time = datetime.datetime.now()
+        self.last_refresh = time.time()
 
-def generate_api_key():
-    return secrets.token_urlsafe(32)
+    async def start(self):
+        self.audio_generator = record_audio_yt_dlp(self.stream_url)
 
-async def get_api_key(api_key: str = Depends(api_key_header), db: Session = Depends(get_db)):
-    if api_key is None:
-        raise HTTPException(status_code=403, detail="Could not validate credentials")
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        raise HTTPException(status_code=403, detail="Could not validate credentials")
-    return api_key
+    async def stop(self):
+        if self.audio_generator:
+            await self.audio_generator.aclose()
 
-async def get_live_audio_url(youtube_url):
+    def get_info(self):
+        return {
+            "stream_url": self.stream_url,
+            "client_count": len(self.clients),
+            "uptime": str(datetime.datetime.now() - self.start_time)
+        }
+
+    async def process_audio(self):
+        while True:
+            try:
+                async for audio_chunk, chunk_timestamp in self.audio_generator:
+                    yield audio_chunk, chunk_timestamp
+                    
+                    # Refresh the stream every 30 seconds
+                    if time.time() - self.last_refresh > 30:
+                        self.last_refresh = time.time()
+                        self.audio_generator = record_audio_yt_dlp(self.stream_url)
+                        break
+            except Exception as e:
+                logger.error(f"Error in process_audio: {str(e)}")
+                await asyncio.sleep(5)  # Wait a bit before restarting
+                self.audio_generator = record_audio_yt_dlp(self.stream_url)
+
+active_transcriptions = {}
+
+async def get_latest_stream_url(youtube_url):
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'no_color': True,
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = await asyncio.to_thread(ydl.extract_info, youtube_url, download=False)
-        return info['url']
+        if info is None:
+            raise Exception("Failed to extract stream info")
+        
+        formats = info.get('formats', [info])
+        audio_format = next((f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none'), None)
+        if audio_format is None:
+            raise Exception("No suitable audio format found")
+        
+        return audio_format['url']
 
 async def record_audio_yt_dlp(youtube_url):
-    audio_url = await get_live_audio_url(youtube_url)
-    ffmpeg_cmd = [
-        'ffmpeg',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '5',
-        '-i', audio_url,
-        '-f', 's16le',
-        '-ar', str(RATE),
-        '-ac', str(CHANNELS),
-        '-'
-    ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *ffmpeg_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    
-    buffer = deque(maxlen=BUFFER_SIZE)
-    start_time = time.time()
-    
     while True:
-        audio_chunk = await process.stdout.read(CHUNK * CHANNELS * 2 * RECORD_SECONDS)
-        if not audio_chunk:
-            break
-        
-        current_time = time.time()
-        chunk_age = current_time - start_time
-        buffer.append((audio_chunk, chunk_age, current_time))
-        
-        if len(buffer) == BUFFER_SIZE:
-            oldest_chunk, oldest_age, oldest_timestamp = buffer[0]
-            if oldest_age > BUFFER_SIZE * CHUNK_DURATION:
-                # We've buffered enough old data, start yielding from the most recent
-                for chunk, _, timestamp in reversed(buffer):
-                    yield chunk, timestamp
-                buffer.clear()
-            else:
-                yield oldest_chunk, oldest_timestamp
-                buffer.popleft()
-        
-        start_time = current_time
-    
-    process.terminate()
+        try:
+            audio_url = await get_latest_stream_url(youtube_url)
+            
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
+                '-i', audio_url,
+                '-f', 's16le',
+                '-ar', str(RATE),
+                '-ac', str(CHANNELS),
+                '-'
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+
+            start_time = time.time()
+            while True:
+                audio_chunk = await process.stdout.read(CHUNK * CHANNELS * 2 * RECORD_SECONDS)
+                if not audio_chunk:
+                    break
+                
+                yield audio_chunk, time.time()
+                
+                # Refresh the stream URL every 30 seconds
+                if time.time() - start_time > 30:
+                    break
+
+            process.terminate()
+            await process.wait()
+
+        except Exception as e:
+            logger.error(f"Error in record_audio_yt_dlp: {str(e)}")
+            await asyncio.sleep(5)  # Wait a bit before retrying
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     stream_url = websocket.query_params.get("stream")
-    api_key = websocket.query_params.get("api_key")
-    
     if not stream_url:
         await websocket.close(code=1000, reason="No stream URL provided")
         return
-    
-    if not api_key:
-        await websocket.close(code=1000, reason="No API key provided")
-        return
-    
-    db = next(get_db())
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        await websocket.close(code=1000, reason="Invalid API key")
-        return
 
-    if USE_YT_DLP:
-        audio_generator = record_audio_yt_dlp(stream_url)
+    shared_transcription = None
+    try:
+        async with asyncio.Lock():
+            if stream_url not in active_transcriptions:
+                shared_transcription = SharedTranscription(stream_url)
+                active_transcriptions[stream_url] = shared_transcription
+                await shared_transcription.start()
+            else:
+                shared_transcription = active_transcriptions[stream_url]
+
+        shared_transcription.clients.add(websocket)
+
+        async for audio_chunk, chunk_timestamp in shared_transcription.process_audio():
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                break
+
+            chunk_start_time = time.time()
+            
+            audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            transcription_start = time.time()
+            result = model.transcribe(audio_np)
+            transcription_time = time.time() - transcription_start
+            
+            latency = time.time() - chunk_start_time
+            performance_monitor.update_metrics(transcription_time, latency)
+            
+            if result["text"]:
+                timestamp = datetime.datetime.fromtimestamp(chunk_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                message = {
+                    "type": "transcription",
+                    "text": f"[{timestamp}] {result['text']}"
+                }
+                await asyncio.gather(*[client.send_json(message) for client in shared_transcription.clients if client.client_state == WebSocketState.CONNECTED])
+                logger.info(f"Transcribed: [{timestamp}] {result['text']}")
+            
+            performance_message = {
+                "type": "performance",
+                **performance_monitor.get_metrics()
+            }
+            await asyncio.gather(*[client.send_json(performance_message) for client in shared_transcription.clients if client.client_state == WebSocketState.CONNECTED])
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"Error in websocket_endpoint: {str(e)}")
+    finally:
+        if shared_transcription:
+            shared_transcription.clients.discard(websocket)
+            if not shared_transcription.clients:
+                await shared_transcription.stop()
+                del active_transcriptions[stream_url]
         
-        try:
-            async for audio_chunk, chunk_timestamp in audio_generator:
-                chunk_start_time = time.time()
-                
-                audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                
-                transcription_start = time.time()
-                result = model.transcribe(audio_np, language="en")
-                transcription_time = time.time() - transcription_start
-                
-                latency = time.time() - chunk_start_time
-                performance_monitor.update_metrics(transcription_time, latency)
-                
-                if result["text"]:
-                    timestamp = datetime.datetime.fromtimestamp(chunk_timestamp).strftime('%Y-%m-%d %H:%M:%S')
-                    await websocket.send_json({
-                        "type": "transcription",
-                        "text": f"[{timestamp}] {result['text']}"
-                    })
-                    logger.info(f"Transcribed: [{timestamp}] {result['text']}")
-                
-                await websocket.send_json({
-                    "type": "performance",
-                    **performance_monitor.get_metrics()
-                })
-                
-        except Exception as e:
-            logger.error(f"Error in websocket_endpoint (yt-dlp): {str(e)}")
-        finally:
+        if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.close()
-    else:
-        # Selenium logic remains unchanged
-        ...
 
 @app.get("/")
-async def home(request: Request):
-    return templates.TemplateResponse("register.html", {"request": request})
+async def get(request: Request):
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+        <head>
+            <title>WebSocket Transcription</title>
+        </head>
+        <body>
+            <h1>WebSocket Transcription</h1>
+            <input type="text" id="stream_url" placeholder="Enter YouTube URL">
+            <button onclick="connect()">Connect</button>
+            <div id="transcription">
+                <h2>Transcriptions</h2>
+                <ul id='messages'></ul>
+            </div>
+            <div id='performance'>
+                <h2>Performance Metrics</h2>
+                <p>Average Transcription Time: <span id='avg_time'></span> seconds</p>
+                <p>Average Latency: <span id='avg_latency'></span> seconds</p>
+                <p>Memory Usage: <span id='memory'></span> MB</p>
+                <p>CPU Usage: <span id='cpu'></span>%</p>
+                <p>Uptime: <span id='uptime'></span> seconds</p>
+                <p>Transcription Count: <span id='count'></span></p>
+            </div>
+            <script>
+                var ws;
+                function connect() {
+                    var stream_url = document.getElementById('stream_url').value;
+                    ws = new WebSocket(`ws://${location.host}/ws?stream=${encodeURIComponent(stream_url)}`);
+                    ws.onmessage = function(event) {
+                        var data = JSON.parse(event.data);
+                        if (data.type === "transcription") {
+                            var messages = document.getElementById('messages');
+                            var message = document.createElement('li');
+                            var content = document.createTextNode(data.text);
+                            message.appendChild(content);
+                            messages.appendChild(message);
+                            messages.scrollTop = messages.scrollHeight;
+                        } else if (data.type === "performance") {
+                            document.getElementById('avg_time').textContent = data.avg_transcription_time.toFixed(3);
+                            document.getElementById('avg_latency').textContent = data.avg_latency.toFixed(3);
+                            document.getElementById('memory').textContent = data.memory_usage_mb.toFixed(2);
+                            document.getElementById('cpu').textContent = data.cpu_usage_percent.toFixed(2);
+                            document.getElementById('uptime').textContent = data.uptime_seconds.toFixed(0);
+                            document.getElementById('count').textContent = data.transcription_count;
+                        }
+                    };
+                    ws.onclose = function(event) {
+                        console.log("WebSocket closed. Reconnecting...");
+                        setTimeout(connect, 1000);
+                    };
+                    ws.onerror = function(error) {
+                        console.error("WebSocket error:", error);
+                    };
+                }
+            </script>
+            <style>
+                #messages {
+                    height: 300px;
+                    overflow-y: auto;
+                    border: 1px solid #ccc;
+                    padding: 10px;
+                }
+            </style>
+        </body>
+    </html>
+    """)
 
-@app.post("/register")
-async def register_user(request: Request, username: str = Form(...), email: str = Form(...), db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.username == username).first()
-    if db_user:
-        return templates.TemplateResponse("register.html", {"request": request, "error": "Username already registered"})
-    
-    db_user = db.query(User).filter(User.email == email).first()
-    if db_user:
-        return templates.TemplateResponse("register.html", {"request": request, "error": "Email already registered"})
-    
-    new_user = User(username=username, email=email, api_key=generate_api_key())
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    
-    return templates.TemplateResponse("api_key.html", {"request": request, "api_key": new_user.api_key})
-
-@app.get("/transcribe")
-async def get_transcribe_page(request: Request):
-    stream_url = request.query_params.get("stream", "")
-    api_key = request.query_params.get("api_key", "")
-    return templates.TemplateResponse("transcribe.html", {"request": request, "stream_url": stream_url, "api_key": api_key})
-
-@app.get("/protected")
-async def protected_route(api_key: str = Depends(get_api_key)):
-    return {"message": "This is a protected route"}
-
-@app.get("/users/me")
-async def read_users_me(api_key: str = Depends(get_api_key), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"username": user.username, "email": user.email}
+@app.get("/active-streams")
+async def get_active_streams():
+    streams = []
+    for stream_url, transcription in active_transcriptions.items():
+        streams.append(transcription.get_info())
+    return JSONResponse(content={"active_streams": streams})
 
 if __name__ == "__main__":
+    import os
+    import subprocess
+
+    # Run FFmpeg installation script
+    if not os.path.exists(os.path.expanduser('~/.local/bin/ffmpeg')):
+        subprocess.run(['bash', 'install_ffmpeg.sh'], check=True)
+
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
