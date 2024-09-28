@@ -2,8 +2,16 @@ import logging
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import asyncio
+import whisper
 import numpy as np
+import pyaudio
+import wave
 import threading
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import time
 import warnings
 import yt_dlp
@@ -14,7 +22,6 @@ import psutil
 from collections import deque
 import datetime
 from starlette.websockets import WebSocketState, WebSocketDisconnect
-import whisper
 
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
 
@@ -23,11 +30,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+model = whisper.load_model("base.en")  # Load the English-only base model
+
 # Audio recording settings
 CHUNK = 1024
+FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
+WAVE_OUTPUT_FILENAME = "output.wav"
 
 # Flags to control behavior
 USE_YT_DLP = True
@@ -35,9 +46,6 @@ SAVE_TO_FILE = False
 
 BUFFER_SIZE = 10  # Number of audio chunks to buffer
 CHUNK_DURATION = RECORD_SECONDS  # Duration of each chunk in seconds
-
-# Load Whisper model
-model = whisper.load_model("tiny")
 
 class PerformanceMonitor:
     def __init__(self):
@@ -71,7 +79,6 @@ class SharedTranscription:
         self.clients = set()
         self.lock = asyncio.Lock()
         self.start_time = datetime.datetime.now()
-        self.last_refresh = time.time()
 
     async def start(self):
         self.audio_generator = record_audio_yt_dlp(self.stream_url)
@@ -92,12 +99,6 @@ class SharedTranscription:
             try:
                 async for audio_chunk, chunk_timestamp in self.audio_generator:
                     yield audio_chunk, chunk_timestamp
-                    
-                    # Refresh the stream every 30 seconds
-                    if time.time() - self.last_refresh > 30:
-                        self.last_refresh = time.time()
-                        self.audio_generator = record_audio_yt_dlp(self.stream_url)
-                        break
             except Exception as e:
                 logger.error(f"Error in process_audio: {str(e)}")
                 await asyncio.sleep(5)  # Wait a bit before restarting
@@ -198,7 +199,7 @@ async def websocket_endpoint(websocket: WebSocket):
             audio_np = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
             
             transcription_start = time.time()
-            result = model.transcribe(audio_np)
+            result = model.transcribe(audio_np, language="en")
             transcription_time = time.time() - transcription_start
             
             latency = time.time() - chunk_start_time
@@ -235,71 +236,67 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/")
 async def get(request: Request):
-    return HTMLResponse("""
-    <!DOCTYPE html>
-    <html>
-        <head>
-            <title>WebSocket Transcription</title>
-        </head>
-        <body>
-            <h1>WebSocket Transcription</h1>
-            <input type="text" id="stream_url" placeholder="Enter YouTube URL">
-            <button onclick="connect()">Connect</button>
-            <div id="transcription">
-                <h2>Transcriptions</h2>
-                <ul id='messages'></ul>
-            </div>
-            <div id='performance'>
-                <h2>Performance Metrics</h2>
-                <p>Average Transcription Time: <span id='avg_time'></span> seconds</p>
-                <p>Average Latency: <span id='avg_latency'></span> seconds</p>
-                <p>Memory Usage: <span id='memory'></span> MB</p>
-                <p>CPU Usage: <span id='cpu'></span>%</p>
-                <p>Uptime: <span id='uptime'></span> seconds</p>
-                <p>Transcription Count: <span id='count'></span></p>
-            </div>
-            <script>
-                var ws;
-                function connect() {
-                    var stream_url = document.getElementById('stream_url').value;
-                    ws = new WebSocket(`ws://${location.host}/ws?stream=${encodeURIComponent(stream_url)}`);
-                    ws.onmessage = function(event) {
-                        var data = JSON.parse(event.data);
-                        if (data.type === "transcription") {
-                            var messages = document.getElementById('messages');
-                            var message = document.createElement('li');
-                            var content = document.createTextNode(data.text);
-                            message.appendChild(content);
-                            messages.appendChild(message);
-                            messages.scrollTop = messages.scrollHeight;
-                        } else if (data.type === "performance") {
-                            document.getElementById('avg_time').textContent = data.avg_transcription_time.toFixed(3);
-                            document.getElementById('avg_latency').textContent = data.avg_latency.toFixed(3);
-                            document.getElementById('memory').textContent = data.memory_usage_mb.toFixed(2);
-                            document.getElementById('cpu').textContent = data.cpu_usage_percent.toFixed(2);
-                            document.getElementById('uptime').textContent = data.uptime_seconds.toFixed(0);
-                            document.getElementById('count').textContent = data.transcription_count;
-                        }
-                    };
-                    ws.onclose = function(event) {
-                        console.log("WebSocket closed. Reconnecting...");
-                        setTimeout(connect, 1000);
-                    };
-                    ws.onerror = function(error) {
-                        console.error("WebSocket error:", error);
-                    };
-                }
-            </script>
-            <style>
-                #messages {
-                    height: 300px;
-                    overflow-y: auto;
-                    border: 1px solid #ccc;
-                    padding: 10px;
-                }
-            </style>
-        </body>
-    </html>
+    stream_url = request.query_params.get("stream", "")
+    return HTMLResponse(f"""
+        <html>
+            <body>
+                <h1>WebSocket Transcription</h1>
+                <div id="transcription">
+                    <h2>Transcriptions</h2>
+                    <ul id='messages'></ul>
+                </div>
+                <div id='performance'>
+                    <h2>Performance Metrics</h2>
+                    <p>Average Transcription Time: <span id='avg_time'></span> seconds</p>
+                    <p>Average Latency: <span id='avg_latency'></span> seconds</p>
+                    <p>Memory Usage: <span id='memory'></span> MB</p>
+                    <p>CPU Usage: <span id='cpu'></span>%</p>
+                    <p>Uptime: <span id='uptime'></span> seconds</p>
+                    <p>Transcription Count: <span id='count'></span></p>
+                </div>
+                <script>
+                    var ws;
+                    function connect() {{
+                        var stream_url = "{stream_url}";
+                        ws = new WebSocket(`ws://localhost:8000/ws?stream=${{encodeURIComponent(stream_url)}}`);
+                        ws.onmessage = function(event) {{
+                            var data = JSON.parse(event.data);
+                            if (data.type === "transcription") {{
+                                var messages = document.getElementById('messages');
+                                var message = document.createElement('li');
+                                var content = document.createTextNode(data.text);
+                                message.appendChild(content);
+                                messages.appendChild(message);
+                                messages.scrollTop = messages.scrollHeight;
+                            }} else if (data.type === "performance") {{
+                                document.getElementById('avg_time').textContent = data.avg_transcription_time.toFixed(3);
+                                document.getElementById('avg_latency').textContent = data.avg_latency.toFixed(3);
+                                document.getElementById('memory').textContent = data.memory_usage_mb.toFixed(2);
+                                document.getElementById('cpu').textContent = data.cpu_usage_percent.toFixed(2);
+                                document.getElementById('uptime').textContent = data.uptime_seconds.toFixed(0);
+                                document.getElementById('count').textContent = data.transcription_count;
+                            }}
+                        }};
+                        ws.onclose = function(event) {{
+                            console.log("WebSocket closed. Reconnecting...");
+                            setTimeout(connect, 1000);
+                        }};
+                        ws.onerror = function(error) {{
+                            console.error("WebSocket error:", error);
+                        }};
+                    }}
+                    connect();
+                </script>
+                <style>
+                    #messages {{
+                        height: 300px;
+                        overflow-y: auto;
+                        border: 1px solid #ccc;
+                        padding: 10px;
+                    }}
+                </style>
+            </body>
+        </html>
     """)
 
 @app.get("/active-streams")
